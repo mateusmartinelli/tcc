@@ -325,8 +325,9 @@ def calculate_position_size(spread: pd.Series, portfolio_value: float) -> float:
     return min(size, portfolio_value)
 
 def trade_pair(pair: Tuple[str, str], data: pd.DataFrame, lookback: int,
-              portfolio_value: float, position_state: Dict, trade_log: List, timestamp: datetime) -> Tuple[float, float, int]:
-    """Executa a lógica de trading para um par com controle de holding."""
+              portfolio_value: float, position_state: Dict, trade_log: List, 
+              timestamp: datetime) -> Tuple[float, float, int]:
+    """Executa a lógica de trading para um par com controle de holding e stop-loss acumulado."""
     pair_key = f"{pair[0]}_{pair[1]}"
     try:
         spread, hedge_ratio = compute_spread(pair, data, lookback)
@@ -341,77 +342,162 @@ def trade_pair(pair: Tuple[str, str], data: pd.DataFrame, lookback: int,
         trade_count = 0
         
         if pair_key not in position_state:
-            position_state[pair_key] = {'position': 0, 'hold_days': 0, 'entry_value': 0}
+            position_state[pair_key] = {
+                'position': 0, 
+                'hold_days': 0, 
+                'entry_value': 0,
+                'asset1_position': 0,
+                'asset2_position': 0,
+                'entry_date': None,
+                'last_trade_date': None
+            }
         
         current_z = z_score.iloc[-1]
         current_position = position_state[pair_key]['position']
         hold_days = position_state[pair_key]['hold_days']
         entry_value = position_state[pair_key]['entry_value']
+        entry_date = position_state[pair_key]['entry_date']
+        last_trade_date = position_state[pair_key]['last_trade_date']
+        
+        # Calcula dias na posição
+        days_in_position = 0
+        if entry_date:
+            days_in_position = (timestamp - entry_date).days
         
         if current_position != 0:
             position_state[pair_key]['hold_days'] += 1
         
-        # Calcular retorno atual se estivermos em uma posição
-        if current_position > 0:  # Long position
+        # Calcular retorno atual do dia
+        if current_position > 0:  # Long
             current_return = (spread.iloc[-1] - spread.iloc[-2]) * position_size / portfolio_value
-        elif current_position < 0:  # Short position
+        elif current_position < 0:  # Short
             current_return = -(spread.iloc[-1] - spread.iloc[-2]) * position_size / portfolio_value
         else:
             current_return = 0
-        
-        # Verificar stop loss
-        if current_position != 0 and (current_return / (position_size/portfolio_value)) <= -STOP_LOSS:
-            returns = -STOP_LOSS * (position_size/portfolio_value) - TRANSACTION_COST * 2
-            position_state[pair_key] = {'position': 0, 'hold_days': 0, 'entry_value': 0}
-            trade_count = 1
-            trade_log.append([timestamp, pair[0], pair[1], current_z, returns, 'stop_loss'])
-            return returns, 0, trade_count
-        
-        # Verificar max hold days
-        if hold_days >= MAX_HOLD_DAYS and current_position != 0:
-            returns = current_return - TRANSACTION_COST * 2
-            position_state[pair_key] = {'position': 0, 'hold_days': 0, 'entry_value': 0}
-            trade_count = 1
-            trade_log.append([timestamp, pair[0], pair[1], current_z, returns, 'max_days'])
-            return returns, 0, trade_count
+
+        # Calcular retorno acumulado da posição para o stop-loss
+        if current_position > 0 and hold_days > 0:  # long spread
+            entry_idx = - (hold_days + 1)
+            pnl = (spread.iloc[-1] - spread.iloc[entry_idx]) * position_size
+            cum_return = pnl / portfolio_value
+        elif current_position < 0 and hold_days > 0:  # short spread
+            entry_idx = - (hold_days + 1)
+            pnl = (spread.iloc[entry_idx] - spread.iloc[-1]) * abs(position_size)
+            cum_return = pnl / portfolio_value
+        else:
+            cum_return = 0
         
         # Lógica de trading
         if current_z < -Z_ENTRY_THRESHOLD and current_position == 0:  # Entrada long
             position_state[pair_key] = {
-                'position': position_size, 
+                'position': position_size,
                 'hold_days': 0,
-                'entry_value': portfolio_value
+                'entry_value': portfolio_value,
+                'asset1_position': position_size,
+                'asset2_position': -position_size * hedge_ratio,
+                'entry_date': timestamp,
+                'last_trade_date': timestamp
             }
-            returns = 0  # Sem retorno no dia de entrada
+            trade_log.append([
+                timestamp, pair[0], pair[1], current_z, 0, 'long',
+                position_size,
+                position_size,
+                -position_size * hedge_ratio,
+                0  # Dias em operação (acabou de entrar)
+            ])
             trade_count = 1
-            trade_log.append([timestamp, pair[0], pair[1], current_z, returns, 'long'])
+            
         elif current_z > Z_ENTRY_THRESHOLD and current_position == 0:  # Entrada short
             position_state[pair_key] = {
-                'position': -position_size, 
+                'position': -position_size,
                 'hold_days': 0,
-                'entry_value': portfolio_value
+                'entry_value': portfolio_value,
+                'asset1_position': -position_size,
+                'asset2_position': position_size * hedge_ratio,
+                'entry_date': timestamp,
+                'last_trade_date': timestamp
             }
-            returns = 0  # Sem retorno no dia de entrada
+            trade_log.append([
+                timestamp, pair[0], pair[1], current_z, 0, 'short',
+                position_size,
+                -position_size,
+                position_size * hedge_ratio,
+                0  # Dias em operação
+            ])
             trade_count = 1
-            trade_log.append([timestamp, pair[0], pair[1], current_z, returns, 'short'])
-        elif current_position > 0 and current_z > Z_EXIT_THRESHOLD_LONG:  # Saída long
-            returns = current_return - TRANSACTION_COST * 2
-            position_state[pair_key] = {'position': 0, 'hold_days': 0, 'entry_value': 0}
+
+        # Saída Long: critério corrigido para stop-loss acumulado
+        elif current_position > 0 and (
+            current_z > Z_EXIT_THRESHOLD_LONG or 
+            hold_days >= MAX_HOLD_DAYS or
+            cum_return <= -STOP_LOSS
+        ):
+            trade_type = 'close_long'
+            if hold_days >= MAX_HOLD_DAYS:
+                trade_type = 'max_days'
+            elif cum_return <= -STOP_LOSS:
+                trade_type = 'stop_loss'
+            
+            returns = cum_return - TRANSACTION_COST * 2
+            trade_log.append([
+                timestamp, pair[0], pair[1], current_z, returns, trade_type,
+                position_size,
+                0,  # Posição zerada
+                0,  # Posição zerada
+                days_in_position  # Dias em operação
+            ])
+            position_state[pair_key] = {
+                'position': 0,
+                'hold_days': 0,
+                'entry_value': 0,
+                'asset1_position': 0,
+                'asset2_position': 0,
+                'entry_date': None,
+                'last_trade_date': timestamp
+            }
             trade_count = 1
-            trade_log.append([timestamp, pair[0], pair[1], current_z, returns, 'close_long'])
-        elif current_position < 0 and current_z < Z_EXIT_THRESHOLD_SHORT:  # Saída short
-            returns = current_return - TRANSACTION_COST * 2
-            position_state[pair_key] = {'position': 0, 'hold_days': 0, 'entry_value': 0}
+
+        # Saída Short: critério corrigido para stop-loss acumulado
+        elif current_position < 0 and (
+            current_z < -Z_EXIT_THRESHOLD_SHORT or 
+            hold_days >= MAX_HOLD_DAYS or
+            cum_return <= -STOP_LOSS
+        ):
+            trade_type = 'close_short'
+            if hold_days >= MAX_HOLD_DAYS:
+                trade_type = 'max_days'
+            elif cum_return <= -STOP_LOSS:
+                trade_type = 'stop_loss'
+            
+            returns = cum_return - TRANSACTION_COST * 2
+            trade_log.append([
+                timestamp, pair[0], pair[1], current_z, returns, trade_type,
+                position_size,
+                0,  # Posição zerada
+                0,  # Posição zerada
+                days_in_position  # Dias em operação
+            ])
+            position_state[pair_key] = {
+                'position': 0,
+                'hold_days': 0,
+                'entry_value': 0,
+                'asset1_position': 0,
+                'asset2_position': 0,
+                'entry_date': None,
+                'last_trade_date': timestamp
+            }
             trade_count = 1
-            trade_log.append([timestamp, pair[0], pair[1], current_z, returns, 'close_short'])
+            
         else:  # Manter posição
             returns = current_return
+            if current_position != 0:  # Atualiza data do último trade
+                position_state[pair_key]['last_trade_date'] = timestamp
         
         return returns, position_state[pair_key]['position'], trade_count
     except Exception as e:
         logging.error(f"Erro ao negociar par {pair}: {e}")
-        return 0, position_state.get(pair_key, {'position': 0, 'hold_days': 0, 'entry_value': 0})['position'], 0
-
+        return 0, position_state.get(pair_key, {'position': 0})['position'], 0
+        
 def backtest_strategy(pairs: List[Tuple], data: pd.DataFrame, lookback: int,
                      valid_tickers: List[str], period_idx: int, trading_start: datetime) -> Tuple[float, List, int, List]:
     """Realiza backtesting para uma combinação de parâmetros."""
@@ -513,7 +599,8 @@ def calculate_metrics(returns: List[float], trade_log: List, rf_series: pd.Serie
 
     # Métricas de trade
     trade_df = pd.DataFrame(trade_log,
-                            columns=['timestamp', 'asset1', 'asset2', 'z_score', 'return', 'exit_type'])
+                            columns=['timestamp', 'asset1', 'asset2', 'z_score', 'return', 'exit_type',
+                                'position_size', 'asset1_position', 'asset2_position', 'days_in_position'])
     exit_types = {'close_long', 'close_short', 'stop_loss', 'max_days'}
     exit_df = trade_df[trade_df['exit_type'].isin(exit_types)]
     num_trades = len(exit_df)
@@ -758,8 +845,8 @@ def plot_results(period_metrics: pd.DataFrame, global_metrics: Dict, output_dir:
 
     # 3. Calcula equity e drawdown
     df = pd.DataFrame({'returns': rets})
-    df['equity']   = 100 * (1 + df['returns']).cumprod()
-    df['peak']     = df['equity'].cummax()
+    df['equity'] = 100 * (1 + df['returns']).cumprod()
+    df['peak'] = df['equity'].cummax()
     df['drawdown'] = (df['equity'] - df['peak']) / df['peak'] * 100
 
     # Helper para salvar
@@ -807,67 +894,67 @@ def plot_results(period_metrics: pd.DataFrame, global_metrics: Dict, output_dir:
 
     # 6. Distribuição de retornos (com zoom central)
     try:
-        os.makedirs(output_dir, exist_ok=True)
-        logging.info(f"Diretório pronto: {output_dir}")
-    except Exception as e:
-        logging.error(f"Não foi possível criar diretório: {e}")
-        return
+        trade_log = global_metrics.get("trade_log", [])
+        if isinstance(trade_log, list) and len(trade_log) > 0:
+            trade_columns = [
+                'timestamp', 'asset1', 'asset2', 'z_score', 'return', 'exit_type',
+                'position_size', 'asset1_position', 'asset2_position', 'days_in_position'
+            ]
+            trade_df = pd.DataFrame(trade_log, columns=trade_columns)
+            exit_types = ["close_long", "close_short", "stop_loss", "max_days"]
+            trade_df = trade_df[trade_df["exit_type"].isin(exit_types)]
 
-    trade_log = global_metrics.get("trade_log", [])
-    if isinstance(trade_log, list) and len(trade_log) > 0:
-        trade_df = pd.DataFrame(trade_log, columns=["date", "asset1", "asset2", "z", "ret", "type"])
-        exit_types = ["close_long", "close_short", "stop_loss", "max_days"]
-        trade_df = trade_df[trade_df["type"].isin(exit_types)]
+            if not trade_df.empty:
+                trade_returns = trade_df["return"] * 100
+                minb = np.floor(trade_returns.min() * 2) / 2
+                maxb = np.ceil(trade_returns.max() * 2) / 2
+                bins = np.arange(minb, maxb + 0.1, 0.1)
 
-        if not trade_df.empty:
-            trade_returns = trade_df["ret"] * 100
-            minb = np.floor(trade_returns.min() * 2) / 2
-            maxb = np.ceil(trade_returns.max() * 2) / 2
-            bins = np.arange(minb, maxb + 0.1, 0.1)
-
-            fig, ax = plt.subplots(figsize=(12, 6))
-            n, bins, patches = ax.hist(trade_returns, bins=bins, edgecolor='black', alpha=0.7)
-            ax.set_xlabel('Retorno por Trade (%)')
-            ax.set_ylabel('Frequência')
-            ax.grid(True, alpha=0.3)
-            ax.set_xticks(np.arange(minb, maxb + 0.5, 0.5))
-            fig.autofmt_xdate()
-            save_plot(fig, 'return_distribution_full.png')
-
-            fig, ax = plt.subplots(figsize=(12, 6))
-            zoom_threshold = 1.0
-            zoom_returns = trade_returns[trade_returns > zoom_threshold]
-
-            if not zoom_returns.empty:
-                minz = np.floor(zoom_returns.min() * 2) / 2
-                maxz = np.ceil(zoom_returns.max() * 2) / 2
-                bins_zoom = np.arange(minz, maxz + 0.1, 0.1)
-
-                n_zoom, bins_zoom, patches_zoom = ax.hist(zoom_returns, bins=bins_zoom, edgecolor='black', alpha=0.7)
+                fig, ax = plt.subplots(figsize=(12, 6))
+                n, bins, patches = ax.hist(trade_returns, bins=bins, edgecolor='black', alpha=0.7)
                 ax.set_xlabel('Retorno por Trade (%)')
                 ax.set_ylabel('Frequência')
                 ax.grid(True, alpha=0.3)
-                ax.set_xticks(np.arange(minz, maxz + 0.5, 0.5))
-
-                for count, bin_left in zip(n_zoom, bins_zoom[:-1]):
-                    if count > 0:
-                        ax.text(
-                            bin_left + (bins_zoom[1] - bins_zoom[0]) / 2,
-                            count,
-                            f"{int(count)}",
-                            ha='center',
-                            va='bottom',
-                            fontsize=8,
-                            rotation=90
-                        )
+                ax.set_xticks(np.arange(minb, maxb + 0.5, 0.5))
                 fig.autofmt_xdate()
-                save_plot(fig, 'return_distribution_zoom_tail.png')
+                save_plot(fig, 'return_distribution_full.png')
+
+                fig, ax = plt.subplots(figsize=(12, 6))
+                zoom_threshold = 1.0
+                zoom_returns = trade_returns[trade_returns > zoom_threshold]
+
+                if not zoom_returns.empty:
+                    minz = np.floor(zoom_returns.min() * 2) / 2
+                    maxz = np.ceil(zoom_returns.max() * 2) / 2
+                    bins_zoom = np.arange(minz, maxz + 0.1, 0.1)
+
+                    n_zoom, bins_zoom, patches_zoom = ax.hist(zoom_returns, bins=bins_zoom, edgecolor='black', alpha=0.7)
+                    ax.set_xlabel('Retorno por Trade (%)')
+                    ax.set_ylabel('Frequência')
+                    ax.grid(True, alpha=0.3)
+                    ax.set_xticks(np.arange(minz, maxz + 0.5, 0.5))
+
+                    for count, bin_left in zip(n_zoom, bins_zoom[:-1]):
+                        if count > 0:
+                            ax.text(
+                                bin_left + (bins_zoom[1] - bins_zoom[0]) / 2,
+                                count,
+                                f"{int(count)}",
+                                ha='center',
+                                va='bottom',
+                                fontsize=8,
+                                rotation=90
+                            )
+                    fig.autofmt_xdate()
+                    save_plot(fig, 'return_distribution_zoom_tail.png')
+                else:
+                    logging.warning("Sem retornos acima do limiar para plotar cauda.")
             else:
-                logging.warning("Sem retornos acima do limiar para plotar cauda.")
+                logging.warning("Nenhum trade encerrado encontrado para plotar zoom na cauda.")
         else:
-            logging.warning("Nenhum trade encerrado encontrado para plotar zoom na cauda.")
-    else:
-        logging.warning("trade_log ausente ou vazio; gráfico de zoom na cauda não gerado.")
+            logging.warning("trade_log ausente ou vazio; gráfico de zoom na cauda não gerado.")
+    except Exception as e:
+        logging.error(f"Erro ao plotar distribuição de retornos: {e}")
 
     # 7. Sharpe Ratio por Período
     try:
@@ -1021,7 +1108,7 @@ def optimize_strategy(periods: pd.DataFrame,
                 if not all_returns.empty:
                     all_returns = period_series.combine_first(all_returns)
                 else:
-                    all_returns = period_series
+                    all_returns = all_returns.combine_first(period_series)
             all_trade_log.extend(result['trade_log'])
             trading_dates.extend(period_dates)
             processed_periods += 1
@@ -1207,116 +1294,100 @@ def optimize_strategy(periods: pd.DataFrame,
     return best_results, global_metrics
 
 def main(use_cache: bool = True, force_reprocess: Optional[List[int]] = None) -> None:
-    """Função principal com controle de cache, análise de crise e geração de gráficos."""
+    """Função principal com todas as atualizações."""
     try:
         start_time = time.time()
 
-        # 0. Limpeza e criação de diretórios
+        # 1) Limpa resultados se não usar cache
         if not use_cache and os.path.exists(RESULTS_DIR):
             shutil.rmtree(RESULTS_DIR)
+
+        # 2) Garante diretórios
         os.makedirs(RESULTS_DIR, exist_ok=True)
         os.makedirs(ANALYSIS_DIR, exist_ok=True)
         os.makedirs(CACHE_DIR, exist_ok=True)
+
         logging.info(f"Modo cache {'ativado' if use_cache else 'desativado'}.")
 
-        # 1. Carregar dados (incluindo market_index se seu load_data retornar)
-        # Se load_data não retorna market_index, carregue-o aqui manualmente:
-        pt_data, rt_data, periods, semester_tickers, rf, market_index = load_data()
-        market_index = pd.read_csv(
-            os.path.join(DATA_DIR, 'market_index.csv'),
-            parse_dates=['Date'], index_col='Date'
-        )
+        # 3) Carrega dados
+        pt_data, rt_data, periods, semester_tickers, rf_series, market_index = load_data()
 
-        # 2. Executar estratégia
+        # 4) Executa otimização (corrigido: sem passar market_index)
         best_results, global_metrics = optimize_strategy(
             periods,
             pt_data,
             rt_data,
             semester_tickers,
-            rf,
+            rf_series,
             use_cache=use_cache,
             force_reprocess=force_reprocess
         )
 
-        # 3. Normalizar daily_returns
-        all_rets = global_metrics.get('daily_returns')
-        idx      = global_metrics.get('daily_returns_index')
-        if isinstance(all_rets, pd.Series):
-            rets_series = all_rets.sort_index()
+        # 5) Assegura formatos de daily_returns para plotting
+        all_returns = global_metrics.get('daily_returns')
+        if isinstance(all_returns, pd.Series):
+            global_metrics['daily_returns'] = all_returns.values
+            global_metrics['daily_returns_index'] = all_returns.index
         else:
+            idx = global_metrics.get('daily_returns_index')
             if idx is None:
                 raise ValueError("Falta 'daily_returns_index' em global_metrics.")
-            rets_series = pd.Series(all_rets, index=idx).sort_index()
-        global_metrics['daily_returns']       = rets_series.values
-        global_metrics['daily_returns_index'] = rets_series.index
+            global_metrics['daily_returns'] = all_returns
+            global_metrics['daily_returns_index'] = idx
 
-        # 4. Análise de crise
-        crisis_res = analyze_crisis_performance(rets_series, market_index)
+        # 6) Analisa desempenho em crises usando o índice de mercado
+        returns_series = pd.Series(
+            global_metrics['daily_returns'],
+            index=global_metrics['daily_returns_index']
+        )
+        crisis_res = analyze_crisis_performance(returns_series, market_index)
         global_metrics.update(crisis_res)
 
-        # 5. Métricas Globais
-        logging.info("\n=== Métricas Globais ===")
-        logging.info(f"Retorno Cumulativo      : {global_metrics['cumulative_return']*100:.2f}%")
-        logging.info(f"Retorno Anualizado      : {global_metrics['annualized_return']*100:.2f}%")
-        logging.info(f"Sharpe Ratio            : {global_metrics['sharpe_ratio']:.4f}")
-        logging.info(f"Sortino Ratio           : {global_metrics['sortino_ratio']:.4f}")
-        logging.info(f"Omega Ratio             : {global_metrics['omega_ratio']:.4f}")
-        logging.info(f"Kappa 3 Ratio           : {global_metrics['kappa_3_ratio']:.4f}")
-        logging.info(f"Calmar Ratio            : {global_metrics['calmar_ratio']:.4f}")
-        logging.info(f"Sterling Ratio          : {global_metrics['sterling_ratio']:.4f}")
-        logging.info(f"Drawdown Máximo         : {global_metrics['max_drawdown']*100:.2f}%")
-        logging.info(f"Taxa de Vitórias        : {global_metrics['win_rate']*100:.2f}%")
-        logging.info(f"Retorno Médio por Trade : {global_metrics['avg_trade_return']*100:.4f}%")
-        logging.info(f"Total de Trades         : {global_metrics['num_trades']}")
-
-        # 6. Desempenho Durante/Fora de Crises e Comparação
-        cs   = global_metrics.get('crisis_stats', {})
-        ncs  = global_metrics.get('non_crisis_stats', {})
-        comp = global_metrics.get('comparison', {})
-
+        # 7) Log de resultados de crise
+        cs  = global_metrics.get('crisis_stats', {})
+        ncs = global_metrics.get('non_crisis_stats', {})
+        cmp = global_metrics.get('comparison', {})
         if cs:
             logging.info("\nDesempenho Durante Crises:")
             logging.info(f"Dias em crise           : {cs.get('days', 0)}")
             logging.info(f"Retorno total crise     : {cs.get('total_return', 0)*100:.2f}%")
             logging.info(f"Sharpe Ratio crise      : {cs.get('sharpe_ratio', 0):.2f}")
-        logging.info("")  # linha em branco
-
         if ncs:
-            logging.info("Desempenho Fora de Crises:")
+            logging.info("\nDesempenho Fora de Crises:")
             logging.info(f"Dias fora de crise      : {ncs.get('days', 0)}")
             logging.info(f"Retorno total fora      : {ncs.get('total_return', 0)*100:.2f}%")
             logging.info(f"Sharpe Ratio fora       : {ncs.get('sharpe_ratio', 0):.2f}")
-        logging.info("")
+        if cmp:
+            logging.info("\nComparação:")
+            logging.info(f"Retorno relativo (c/n)  : {cmp.get('return_ratio', 0):.2f}")
+            logging.info(f"Diferença Sharpe        : {cmp.get('sharpe_ratio_diff', 0):.2f}")
+            logging.info(f"Outperformance absoluta : {cmp.get('outperformance', 0)*100:.2f}%")
 
-        if comp:
-            logging.info("Comparação:")
-            logging.info(f"Retorno relativo (c/n)  : {comp.get('return_ratio', 0):.2f}")
-            logging.info(f"Diferença Sharpe        : {comp.get('sharpe_ratio_diff', 0):.2f}")
-            logging.info(f"Outperformance absoluta : {comp.get('outperformance', 0)*100:.2f}%")
-        logging.info("")
+        # 8) Exibe métricas globais
+        logging.info("\nMétricas Globais:")
+        for key, label, fmt in [
+            ('cumulative_return',  'Retorno Cumulativo     ', '{:.2f}%'),
+            ('annualized_return',  'Retorno Anualizado     ', '{:.2f}%'),
+            ('sharpe_ratio',       'Sharpe Ratio           ', '{:.4f}'),
+            ('sortino_ratio',      'Sortino Ratio          ', '{:.4f}'),
+            ('omega_ratio',        'Omega Ratio            ', '{:.4f}'),
+            ('kappa_3_ratio',      'Kappa 3 Ratio          ', '{:.4f}'),
+            ('calmar_ratio',       'Calmar Ratio           ', '{:.4f}'),
+            ('sterling_ratio',     'Sterling Ratio         ', '{:.4f}'),
+            ('max_drawdown',       'Drawdown Máximo        ', '{:.2f}%'),
+            ('win_rate',           'Taxa de Vitórias       ', '{:.2f}%'),
+            ('avg_trade_return',   'Retorno Médio por Trade', '{:.4f}%'),
+            ('num_trades',         'Total de Trades        ', '{}')
+        ]:
+            val = global_metrics.get(key, 0)
+            if key in ['cumulative_return', 'annualized_return',
+                       'max_drawdown', 'win_rate', 'avg_trade_return']:
+                val *= 100
+            logging.info(f"{label}: {fmt.format(val)}")
 
-        # 7. Períodos de Crise Identificados
-        cp = global_metrics.get('crisis_periods', pd.DataFrame())
-        # filtra 2018-01-01 até 2024-12-31
-        cp = cp[
-            (cp['start_date'] >= pd.Timestamp('2018-01-01')) &
-            (cp['end_date']   <= pd.Timestamp('2024-12-31'))
-        ]
-        if not cp.empty:
-            logging.info("Períodos de Crise Identificados:")
-            for rec in cp.to_dict('records'):
-                logging.info(
-                    f"{rec['start_date'].date()} a {rec['end_date'].date()} - "
-                    f"Queda: {rec['%_decline']}% | Duração: {rec['duration_days']} dias"
-                )
-
-        # 8. Métricas por Período
-        logging.info("\n=== Métricas por Período ===")
+        # 9) Exibe métricas por período
+        logging.info("\nMétricas por Período:")
         for period_idx, res in best_results.items():
-            tl = res.get('trading_length', len(res['returns']))
-            ds = pd.Series(res['returns'][:tl])
-            period_return = (1 + ds).prod() - 1 if not ds.empty else 0.0
-
             logging.info(
                 f"Período {period_idx}: Lookback={res['lookback']}, "
                 f"Sharpe={res['sharpe']:.4f}, "
@@ -1325,38 +1396,40 @@ def main(use_cache: bool = True, force_reprocess: Optional[List[int]] = None) ->
                 f"Win Rate={res['metrics']['win_rate']:.4f}"
             )
 
-        # (Opcional) também salvamos esse resumo em CSV
-        period_metrics = []
-        for idx, res in best_results.items():
-            tl = res.get('trading_length', len(res['returns']))
-            ds = pd.Series(res['returns'][:tl])
-            pr = (1 + ds).prod() - 1 if not ds.empty else 0.0
-            period_metrics.append({
-                'period':           idx,
-                'lookback':         res['lookback'],
-                'sharpe_ratio':     res['sharpe'],
-                'period_return':    pr,
-                'num_trades':       res['metrics']['num_trades'],
-                'win_rate':         res['metrics']['win_rate'],
-                'avg_trade_return': res['metrics']['avg_trade_return']
-            })
-        metrics_df = pd.DataFrame(period_metrics).sort_values('period')
-        metrics_df.to_csv(os.path.join(RESULTS_DIR, 'metrics_summary.csv'), index=False)
+        logging.info(f"\nResultados salvos em {RESULTS_DIR}")
+        logging.info(f"Tempo total de execução: {time.time() - start_time:.2f}s")
 
-        # 9. Geração de gráficos
-        plot_results(metrics_df, global_metrics, ANALYSIS_DIR)
-        logging.info(f"\nGráficos gerados em: {ANALYSIS_DIR}")
+        # 10) Geração de gráficos e arquivos de saída
+        try:
+            period_data = [{
+                'period':        idx,
+                'lookback':      res['lookback'],
+                'sharpe_ratio':  res['sharpe'],
+                'cumulative_return': res['metrics']['cumulative_return'],
+                'num_trades':    res['metrics']['num_trades'],
+                'win_rate':      res['metrics']['win_rate'],
+                'start_date':    res['trading_start'],
+                'end_date':      res['trading_end']
+            } for idx, res in best_results.items()]
 
-        # 10. Finalização
-        logging.info(f"Execução finalizada em {time.time() - start_time:.2f} segundos")
+            period_metrics = pd.DataFrame(period_data).sort_values('period')
+            period_metrics.to_csv(os.path.join(ANALYSIS_DIR, "period_metrics.csv"), index=False)
+
+            plot_results(period_metrics, global_metrics, ANALYSIS_DIR)
+
+            if 'trade_log' in global_metrics:
+                save_trades_to_csv(global_metrics['trade_log'], ANALYSIS_DIR)
+
+            logging.info(f"Arquivos de análise gerados em {ANALYSIS_DIR}")
+        except Exception as e:
+            logging.error(f"Falha ao gerar saídas: {e}\n{traceback.format_exc()}")
 
     except FileNotFoundError as e:
-        logging.error(f"Arquivo não encontrado: {e}")
+        logging.error(f"Erro: {e}")
     except ValueError as e:
         logging.error(f"Erro de valor: {e}")
     except Exception as e:
-        logging.error(f"Erro inesperado: {e}")
-        logging.error(traceback.format_exc())
+        logging.error(f"Erro inesperado: {e}\n{traceback.format_exc()}")
 if __name__ == "__main__":
     # Clear old cache if needed
     if os.path.exists(PAIRS_CACHE_FILE):
