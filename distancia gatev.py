@@ -295,19 +295,30 @@ def trade_pair(pair: Tuple[str, str], data: pd.DataFrame, lookback: int,
             position_type = "none"
 
         # Verifica Stop Loss
-        if current_position != 0 and (current_return / (position_size / portfolio_value)) <= -STOP_LOSS:
-            returns = -STOP_LOSS * (position_size / portfolio_value) - TRANSACTION_COST * 2
-            position_state[pair_key] = {'position': 0, 'hold_days': 0, 'entry_value': 0}
-            trade_count = 1
-            trade_log.append({
-                'timestamp': timestamp,
-                'asset1': pair[0],
-                'asset2': pair[1],
-                'z_score': current_z,
-                'return': returns,
-                'trade_type': f'stop_loss_{position_type}'
-            })
-            return returns, 0, trade_count
+        if current_position != 0:
+            # Certifique-se de que 'entry_spread' foi salvo ao abrir a posição!
+            entry_spread = position_state[pair_key].get('entry_spread', None)
+            if entry_spread is not None and abs(entry_spread) > 1e-8:
+                # Calcula P&L acumulado da posição em relação ao valor do spread de entrada
+                if current_position > 0:  # Long
+                    pnl_pct = (spread.iloc[-1] - entry_spread) / abs(entry_spread)
+                else:  # Short
+                    pnl_pct = (entry_spread - spread.iloc[-1]) / abs(entry_spread)
+
+                # Checa stop-loss
+                if pnl_pct <= -STOP_LOSS:
+                    returns = -STOP_LOSS * (position_size / portfolio_value) - TRANSACTION_COST * 2
+                    position_state[pair_key] = {'position': 0, 'hold_days': 0, 'entry_value': 0, 'entry_spread': 0}
+                    trade_count = 1
+                    trade_log.append({
+                        'timestamp': timestamp,
+                        'asset1': pair[0],
+                        'asset2': pair[1],
+                        'z_score': current_z,
+                        'return': returns,
+                        'trade_type': f'stop_loss_{"long" if current_position > 0 else "short"}'
+                    })
+                    return returns, 0, trade_count
 
         # Verifica Max Hold Days
         if hold_days >= MAX_HOLD_DAYS and current_position != 0:
@@ -1172,7 +1183,7 @@ def optimize_strategy(
     return best_results, global_metrics
 
 def main(use_cache: bool = True, force_reprocess: Optional[List[int]] = None) -> None:
-    """Função principal com controle de cache."""
+    """Função principal com todas as atualizações."""
     try:
         start_time = time.time()
         # 1) Limpa resultados se não usar cache
@@ -1187,77 +1198,56 @@ def main(use_cache: bool = True, force_reprocess: Optional[List[int]] = None) ->
 
         # 3) Carrega dados
         pt_data, rt_data, periods, semester_tickers, rf_series, market_index = load_data()
-
-        # 4) Executa otimização
+        
+        # 4) Executa otimização, incluindo market_index
         best_results, global_metrics = optimize_strategy(
-            periods,
-            pt_data,
-            rt_data,
-            semester_tickers,
-            rf_series,
-            market_index,
+            periods, pt_data, rt_data, semester_tickers,
+            rf_series, market_index,
             use_cache=use_cache,
             force_reprocess=force_reprocess
         )
 
-        # 5) Depuração: Log do conteúdo de global_metrics
-        logging.info(f"global_metrics keys: {list(global_metrics.keys())}")
-        logging.info(f"daily_returns: type={type(global_metrics.get('daily_returns'))}, "
-                     f"length={len(global_metrics['daily_returns']) if hasattr(global_metrics.get('daily_returns'), '__len__') else 'N/A'}")
-        logging.info(f"daily_returns_index: type={type(global_metrics.get('daily_returns_index'))}, "
-                     f"length={len(global_metrics['daily_returns_index']) if hasattr(global_metrics.get('daily_returns_index'), '__len__') else 'N/A'}")
-        logging.info(f"equity_curve: type={type(global_metrics.get('equity_curve'))}, "
-                     f"length={len(global_metrics['equity_curve']) if hasattr(global_metrics.get('equity_curve'), '__len__') else 'N/A'}")
-        logging.info(f"equity_curve min={global_metrics['equity_curve'].min()}, max={global_metrics['equity_curve'].max()}, mean={global_metrics['equity_curve'].mean()}")
-
-        # 6) Prepara daily_returns para plotting
-        default_index = pd.date_range(start=pd.to_datetime("2018-01-01"), end=pd.to_datetime("2024-12-31"), freq='D')
-        if ('daily_returns' not in global_metrics or 
-            'daily_returns_index' not in global_metrics or
-            not isinstance(global_metrics['daily_returns'], (list, np.ndarray, pd.Series)) or
-            (isinstance(global_metrics['daily_returns'], (list, np.ndarray)) and len(global_metrics['daily_returns']) == 0) or
-            (isinstance(global_metrics['daily_returns'], pd.Series) and global_metrics['daily_returns'].empty)):
-            logging.warning("daily_returns ou daily_returns_index inválidos. Usando valores padrão.")
-            global_metrics['daily_returns'] = pd.Series([0.0] * len(default_index), index=default_index, dtype=float)
-            global_metrics['daily_returns_index'] = default_index
-            global_metrics['equity_curve'] = pd.Series([1.0] * len(default_index), index=default_index, dtype=float)
+        # 5) Assegura formatos de daily_returns para plotting
+        all_returns = global_metrics.get('daily_returns')
+        if isinstance(all_returns, pd.Series):
+            global_metrics['daily_returns'] = all_returns.values
+            global_metrics['daily_returns_index'] = all_returns.index
         else:
-            # Garante que daily_returns seja uma pd.Series com índice válido
-            if not isinstance(global_metrics['daily_returns'], pd.Series):
-                try:
-                    global_metrics['daily_returns'] = pd.Series(
-                        global_metrics['daily_returns'],
-                        index=global_metrics['daily_returns_index'],
-                        dtype=float
-                    )
-                except Exception as e:
-                    logging.error(f"Erro ao criar pd.Series para daily_returns: {e}")
-                    global_metrics['daily_returns'] = pd.Series([0.0] * len(default_index), index=default_index, dtype=float)
-                    global_metrics['daily_returns_index'] = default_index
+            idx = global_metrics.get('daily_returns_index')
+            if idx is None:
+                raise ValueError("Falta 'daily_returns_index' em global_metrics.")
+            global_metrics['daily_returns'] = all_returns
+            global_metrics['daily_returns_index'] = idx
 
-            # Deriva equity_curve se necessário
-            if 'equity_curve' not in global_metrics or global_metrics['equity_curve'] is None or global_metrics['equity_curve'].empty:
-                logging.warning("equity_curve inválido. Derivando a partir de daily_returns.")
-                global_metrics['equity_curve'] = (1 + global_metrics['daily_returns']).cumprod()
+        # 6) Analisa desempenho em crises usando o mercado
+        returns_series = pd.Series(
+            global_metrics['daily_returns'],
+            index=global_metrics['daily_returns_index']
+        )
+        crisis_res = analyze_crisis_performance(returns_series, market_index)
+        global_metrics.update(crisis_res)
 
-        # 7) Análise de crise usando analyze_crisis_performance
-        crisis_analysis = analyze_crisis_performance(global_metrics['daily_returns'], pd.DataFrame({'Close': market_index}))
-        global_metrics['crisis_periods'] = crisis_analysis['crisis_periods']
-        global_metrics['crisis_stats'] = crisis_analysis['crisis_stats']
-        global_metrics['non_crisis_stats'] = crisis_analysis['non_crisis_stats']
-        global_metrics['comparison'] = crisis_analysis['comparison']
-        global_metrics['total_days'] = crisis_analysis['total_days']
-        global_metrics['accounted_days'] = crisis_analysis['accounted_days']
+        # 7) Log de resultados de crise
+        cs = global_metrics.get('crisis_stats', {})
+        ncs = global_metrics.get('non_crisis_stats', {})
+        comp = global_metrics.get('crisis_comparison', {})
+        if cs:
+            logging.info("\nDesempenho Durante Crises:")
+            logging.info(f"Dias em crise           : {cs.get('days', 0)}")
+            logging.info(f"Retorno total crise     : {cs.get('total_return', 0)*100:.2f}%")
+            logging.info(f"Sharpe Ratio crise     : {cs.get('sharpe_ratio', 0):.2f}")
+        if ncs:
+            logging.info("\nDesempenho Fora de Crises:")
+            logging.info(f"Dias fora de crise      : {ncs.get('days', 0)}")
+            logging.info(f"Retorno total fora      : {ncs.get('total_return', 0)*100:.2f}%")
+            logging.info(f"Sharpe Ratio fora      : {ncs.get('sharpe_ratio', 0):.2f}")
+        if comp:
+            logging.info("\nComparação:")
+            logging.info(f"Retorno relativo (c/n) : {comp.get('return_ratio', 0):.2f}")
+            logging.info(f"Diferença Sharpe       : {comp.get('sharpe_ratio_diff', 0):.2f}")
+            logging.info(f"Outperformance absoluta: {comp.get('outperformance', 0)*100:.2f}%")
 
-        # 8) Exibe métricas de crise
-        cs = global_metrics['crisis_stats'] or {'mean_return': 0, 'std_return': 0, 'total_return': 0, 'sharpe_ratio': 0, 'days': 0}
-        ncs = global_metrics['non_crisis_stats'] or {'mean_return': 0, 'std_return': 0, 'total_return': 0, 'sharpe_ratio': 0, 'days': 0}
-        comp = global_metrics['comparison'] or {'return_ratio': 0, 'sharpe_ratio_diff': 0, 'outperformance': 0, 'days_diff': 0}
-        logging.info(f"\nDesempenho Durante Crises: Dias={cs['days']}, Retorno={(cs['total_return']*100):.2f}%, Sharpe={cs['sharpe_ratio']:.2f}")
-        logging.info(f"Desempenho Fora de Crises: Dias={ncs['days']}, Retorno={(ncs['total_return']*100):.2f}%, Sharpe={ncs['sharpe_ratio']:.2f}")
-        logging.info(f"Comparação: Retorno_Ratio={comp['return_ratio']:.2f}, Sharpe_Diff={comp['sharpe_ratio_diff']:.2f}, Outperf={(comp['outperformance']*100):.2f}%")
-
-        # 9) Exibição de métricas globais
+        # 8) Exibe métricas globais
         logging.info("\nMétricas Globais:")
         for key, label, fmt in [
             ('cumulative_return', 'Retorno Cumulativo     ', '{:.2f}%'),
@@ -1278,45 +1268,70 @@ def main(use_cache: bool = True, force_reprocess: Optional[List[int]] = None) ->
                 val *= 100
             logging.info(f"{label}: {fmt.format(val)}")
 
-        # 10) Exibe períodos de crise
-        if not global_metrics['crisis_periods'].empty:
+        # 9) Exibe períodos de crise
+        cp = global_metrics.get('crisis_periods', pd.DataFrame())
+        if not cp.empty:
             logging.info("\nPeríodos de Crise Identificados:")
-            for rec in global_metrics['crisis_periods'].to_dict('records'):
-                logging.info(f"{rec['start_date'].date()} a {rec['end_date'].date()} - Queda: {rec['%_decline']}%, Duração: {rec['duration_days']} dias")
+            for rec in cp.to_dict('records'):
+                logging.info(
+                    f"{rec['start_date'].date()} a {rec['end_date'].date()} - "
+                    f"Queda: {rec['%_decline']}% | Duração: {rec['duration_days']} dias"
+                )
 
-        # 11) Exibe métricas por período
+        # 10) Exibe métricas por período (formato único)
         logging.info("\nMétricas por Período:")
-        for idx, res in best_results.items():
+        for period_idx, res in best_results.items():
             msg = (
-                f"Período {idx}: Lookback={res['lookback']}, Sharpe={res['sharpe']:.4f}, Retorno={res['metrics']['cumulative_return']*100:.2f}%, "
-                f"Trades={res['metrics']['num_trades']}, Win Rate={res['metrics']['win_rate']:.4f}"
+                f"Período {period_idx}: Lookback={res['lookback']}, "
+                f"Sharpe={res['sharpe']:.4f}, "
+                f"Retorno={res['metrics']['cumulative_return']*100:.2f}%, "
+                f"Trades={res['metrics']['num_trades']}, "
+                f"Win Rate={res['metrics']['win_rate']:.4f}"
             )
             logging.info(msg)
 
-        # 12) Geração de gráficos
+        logging.info(f"\nResultados salvos em {RESULTS_DIR}")
+        logging.info(f"Tempo total de execução: {time.time()-start_time:.2f}s")
+
+        # 11) Geração de gráficos e arquivos de saída
         try:
-            period_metrics = pd.DataFrame([{
-                'period': idx,
-                'lookback': res['lookback'],
-                'sharpe_ratio': res['sharpe'],
-                'cumulative_return': res['metrics']['cumulative_return']
-            } for idx, res in best_results.items()]).sort_values('period')
+            # Cria DataFrame com métricas por período
+            period_data = []
+            for period_idx, res in best_results.items():
+                period_data.append({
+                    'period': period_idx,
+                    'lookback': res['lookback'],
+                    'sharpe_ratio': res['sharpe'],
+                    'cumulative_return': res['metrics']['cumulative_return'],
+                    'num_trades': res['metrics']['num_trades'],
+                    'win_rate': res['metrics']['win_rate'],
+                    'start_date': res['trading_start'],
+                    'end_date': res['trading_end']
+                })
             
+            period_metrics = pd.DataFrame(period_data).sort_values('period')
+
+            # Salva métricas por período em CSV
+            period_metrics.to_csv(os.path.join(ANALYSIS_DIR, "period_metrics.csv"), index=False)
+            
+            # Gera gráficos
             plot_results(period_metrics, global_metrics, ANALYSIS_DIR)
-            logging.info(f"Gráficos gerados em {ANALYSIS_DIR}")
+            
+            # Salva trades em CSV
+            if 'trade_log' in global_metrics:
+                save_trades_to_csv(global_metrics['trade_log'], ANALYSIS_DIR)
+            
+            logging.info(f"Arquivos de análise gerados em {ANALYSIS_DIR}")
+            
         except Exception as e:
-            logging.error(f"Falha ao gerar gráficos: {e}")
+            logging.error(f"Falha ao gerar saídas: {e}\n{traceback.format_exc()}")
 
     except FileNotFoundError as e:
         logging.error(f"Erro: {e}")
-        logging.error(traceback.format_exc())
     except ValueError as e:
         logging.error(f"Erro de valor: {e}")
-        logging.error(traceback.format_exc())
     except Exception as e:
-        logging.error(f"Erro inesperado: {e}")
-        logging.error(traceback.format_exc())
-
+        logging.error(f"Erro inesperado: {e}\n{traceback.format_exc()}")
 if __name__ == "__main__":
     # Clear old cache if needed
     if os.path.exists(PAIRS_CACHE_FILE):
