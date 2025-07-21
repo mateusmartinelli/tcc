@@ -519,91 +519,79 @@ def calculate_metrics(
     """
     Calcula métricas de performance a partir de:
       - returns_series: série de retornos diários (pd.Series, index datetime)
-      - trade_log: lista de tuplas/objetos com informação de cada trade
-      - rf_series: série de retornos diários risk-free (pd.Series, index datetime)
-    Retorna dicionário com:
-      - cumulative_return
-      - annualized_return
-      - sharpe_ratio
-      - sortino_ratio
-      - omega_ratio
-      - kappa_3_ratio
-      - calmar_ratio
-      - sterling_ratio
-      - max_drawdown
-      - win_rate
-      - avg_trade_return
-      - num_trades
+      - trade_log: lista de tuplas (timestamp, asset1, asset2, z_score, return, exit_type, …)
+      - rf_series: série de retornos diários risk‑free (pd.Series, index datetime)
+    Retorna dicionário com métricas, incluindo 'max_drawdown' anualizado.
     """
-    # 1) alinhar rf e calcular retornos excedentes
-    rf_aligned = rf_series.reindex(returns_series.index).fillna(method='ffill').fillna(0.0)
-    excess_returns = returns_series - rf_aligned
+    # 1) Alinhamento e cálculo de retornos em excesso
+    raw_ret      = returns_series
+    rf_aligned   = rf_series.reindex(raw_ret.index).ffill().fillna(0.0)
+    excess_ret   = raw_ret - rf_aligned
 
-    # 2) métricas básicas
-    cumulative_return = (1 + returns_series).prod() - 1
-    days = returns_series.shape[0]
-    years = days / 365 if days > 0 else np.nan
-
-    # 3) Retorno anualizado (geométrico)
-    if days > 0 and cumulative_return > -1 and years > 0:
-        annualized_return = (1 + cumulative_return) ** (1 / years) - 1
+    # 2) Retorno cumulativo e annualização geométrica sobre excesso
+    cum_ret_excess = (1 + excess_ret).cumprod().iloc[-1] - 1
+    if isinstance(raw_ret.index, pd.DatetimeIndex) and len(raw_ret) > 1:
+        days  = (raw_ret.index[-1] - raw_ret.index[0]).days
+        years = days / 365
     else:
-        annualized_return = np.nan
+        years = len(raw_ret) / 365 if len(raw_ret) > 0 else np.nan
+    annualized_return = (1 + cum_ret_excess) ** (1 / years) - 1 if years > 0 else np.nan
 
-    # 4) Sharpe Ratio
-    mean_excess = excess_returns.mean()
-    std_excess = excess_returns.std(ddof=1)
-    sharpe_ratio = (np.sqrt(365) * mean_excess / std_excess) if std_excess > 0 else np.nan
+    # 3) Métricas de risco usando excesso (Sharpe, Sortino, Omega, Kappa‑3)
+    mean_excess    = excess_ret.mean()
+    std_excess     = excess_ret.std(ddof=1)
+    sharpe_ratio   = np.sqrt(365) * mean_excess / std_excess if std_excess > 0 else np.nan
 
-    # 5) Sortino Ratio (downside risk)
-    negative = returns_series.copy()
-    negative[negative > 0] = 0
-    downside_std = negative.std(ddof=1)
-    sortino_ratio = (np.sqrt(365) * mean_excess / downside_std) if downside_std > 0 else np.nan
+    downs          = excess_ret[excess_ret < 0]
+    std_down       = downs.std(ddof=1) * np.sqrt(365) if not downs.empty else np.nan
+    sortino_ratio  = np.sqrt(365) * mean_excess / std_down if std_down > 0 else np.nan
 
-    # 6) Omega Ratio (threshold = 0)
-    gains = returns_series[returns_series > 0].sum()
-    losses = -returns_series[returns_series < 0].sum()
-    omega_ratio = gains / losses if losses > 0 else np.inf
+    gains          = excess_ret[excess_ret > 0].sum()
+    losses         = -excess_ret[excess_ret < 0].sum()
+    omega_ratio    = gains / losses if losses > 0 else np.inf
 
-    # 7) Kappa-3 Ratio (penalidade cúbica de drawdown)
-    kappa_3_ratio = np.nan  # placeholder; calc. customizado pode ser inserido aqui
+    if not downs.empty and (downs**3).mean() > 0:
+        dd3            = ((downs**3).mean()) ** (1/3) * np.sqrt(365)
+        kappa_3_ratio  = np.sqrt(365) * mean_excess / dd3 if dd3 > 0 else np.nan
+    else:
+        kappa_3_ratio = np.nan
 
-    # 8) Máximo e drawdowns
-    cum = (1 + returns_series).cumprod()
-    running_max = cum.cummax()
-    drawdowns = cum / running_max - 1
-    max_dd = drawdowns.min()
-    avg_dd = drawdowns[drawdowns < 0].mean()
+    # 4) Drawdowns e Calmar/Sterling sobre equity bruta
+    equity         = (1 + raw_ret).cumprod()
+    dd_series      = equity / equity.cummax() - 1
+    max_drawdown   = dd_series.min()
+    avg_drawdown   = dd_series[dd_series < 0].mean() if (dd_series < 0).any() else 0.0
+    calmar_ratio   = annualized_return / abs(max_drawdown) if max_drawdown < 0 else np.inf
+    sterling_ratio = annualized_return / abs(avg_drawdown) if avg_drawdown < 0 else np.inf
 
-    # 9) Calmar e Sterling
-    calmar_ratio = (annualized_return / abs(max_dd)) if max_dd < 0 else np.inf
-    sterling_ratio = (annualized_return / abs(avg_dd)) if avg_dd < 0 else np.inf
-
-    # 10) Métricas de trades: só contas as saídas (round-trips)
-    exit_types = {'close_long', 'close_short', 'stop_loss', 'max_days'}
-    exit_trades = [t for t in trade_log if t[5] in exit_types]
-
-    num_trades = len(exit_trades)
-    wins = sum(1 for t in exit_trades if t[4] > 0)    # t[4] = retorno do trade na saída
-    win_rate = wins / num_trades if num_trades > 0 else np.nan
-    avg_trade_return = np.mean([t[4] for t in exit_trades]) if num_trades > 0 else np.nan
+    # 5) Métricas de trade (média aritmética dos retornos fechados)
+    trade_df       = pd.DataFrame(trade_log, columns=[
+        'timestamp', 'asset1', 'asset2', 'z_score', 'return',
+        'exit_type', 'position_size', 'asset1_position',
+        'asset2_position', 'days_in_position'
+    ])
+    exit_types     = {'close_long', 'close_short', 'stop_loss', 'max_days'}
+    exit_df        = trade_df[trade_df['exit_type'].isin(exit_types)]
+    num_trades     = len(exit_df)
+    avg_trade_return = exit_df['return'].mean() if num_trades > 0 else np.nan
+    win_rate       = (exit_df['return'] > 0).sum() / num_trades if num_trades > 0 else np.nan
 
     return {
-        'cumulative_return': cumulative_return,
+        'cumulative_return': cum_ret_excess,
         'annualized_return': annualized_return,
-        'sharpe_ratio': sharpe_ratio,
-        'sortino_ratio': sortino_ratio,
-        'omega_ratio': omega_ratio,
-        'kappa_3_ratio': kappa_3_ratio,
-        'calmar_ratio': calmar_ratio,
-        'sterling_ratio': sterling_ratio,
-        'max_drawdown': max_dd,
-        'win_rate': win_rate,
-        'avg_trade_return': avg_trade_return,
-        'num_trades': num_trades
+        'sharpe_ratio':      sharpe_ratio,
+        'sortino_ratio':     sortino_ratio,
+        'omega_ratio':       omega_ratio,
+        'kappa_3_ratio':     kappa_3_ratio,
+        'calmar_ratio':      calmar_ratio,
+        'sterling_ratio':    sterling_ratio,
+        'max_drawdown':      max_drawdown,
+        'avg_drawdown':      avg_drawdown,
+        'num_trades':        num_trades,
+        'avg_trade_return':  avg_trade_return,
+        'win_rate':          win_rate
     }
-
+    
 def identify_crisis_periods(market_index: pd.DataFrame, threshold=-0.20) -> pd.DataFrame:
     """
     Versão corrigida que:
@@ -1335,20 +1323,18 @@ def main(use_cache: bool = True, force_reprocess: Optional[List[int]] = None) ->
                     f"Queda: {rec['%_decline']}% | Duração: {rec['duration_days']} dias"
                 )
 
-        # 10) Exibe métricas por período (formato único)
+        # 10) Exibe métricas por período (com datas no formato brasileiro)
         logging.info("\nMétricas por Período:")
-        for idx, res in best_results.items():
-            msg = (
-                f"Período {idx}: Lookback={res['lookback']}, "
+        for res in best_results.values():
+            start = res['trading_start'].strftime('%d/%m/%Y')
+            end   = res['trading_end'].strftime('%d/%m/%Y')
+            logging.info(
+                f"Período {start} a {end}: "
                 f"Sharpe={res['sharpe']:.4f}, "
                 f"Retorno={res['metrics']['cumulative_return']*100:.2f}%, "
                 f"Trades={res['metrics']['num_trades']}, "
-                f"Win Rate={res['metrics']['win_rate']:.4f}"
+                f"Win Rate={res['metrics']['win_rate']*100:.2f}%"
             )
-            logging.info(msg)
-
-        logging.info(f"\nResultados salvos em {RESULTS_DIR}")
-        logging.info(f"Tempo total de execução: {time.time()-start_time:.2f}s")
 
         # 11) Geração de gráficos e arquivos de saída
         try:
