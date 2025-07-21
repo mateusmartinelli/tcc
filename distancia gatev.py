@@ -180,7 +180,11 @@ def calculate_ssd(pair: Tuple[str, str], data: pd.DataFrame) -> float:
 def select_pairs_by_distance(formation_data: pd.DataFrame, valid_tickers: List[str]) -> List[Tuple]:
     """Seleciona pares com base no método de distância (SSD) conforme o artigo."""
     start_time = time.time()
-    assets = [t for t in valid_tickers if t in formation_data.columns and formation_data[t].isna().mean() < 0.20]
+    assets = [
+        t for t in valid_tickers
+        if t in formation_data.columns
+           and formation_data[t].notna().all()
+    ]
     
     if len(assets) < MIN_TICKERS:
         logging.warning(f"Ignorando período: apenas {len(assets)} tickers (< {MIN_TICKERS})")
@@ -225,16 +229,31 @@ def select_pairs_by_distance(formation_data: pd.DataFrame, valid_tickers: List[s
     return selected_pairs
 
 def compute_spread(pair: Tuple[str, str], data: pd.DataFrame, lookback: int) -> Tuple[pd.Series, float]:
-    asset1, asset2, _, _, hedge_ratio, _ = pair[:6]
-    y = data[asset1][-lookback:].reset_index(drop=True)
-    x = data[asset2][-lookback:].reset_index(drop=True)
+    """Calcula o spread pelo método da distância (não‑paramétrico)."""
+    # só precisamos dos dois ativos
+    asset1, asset2 = pair[:2]
     
+    # últimos lookback pontos e reset do índice
+    y = data[asset1].iloc[-lookback:].reset_index(drop=True)
+    x = data[asset2].iloc[-lookback:].reset_index(drop=True)
+    
+    # validação de NaNs
     if y.isna().any() or x.isna().any():
         logging.warning(f"Missing data in pair {asset1}-{asset2}")
         raise ValueError(f"Dados insuficientes para o par ({asset1}, {asset2})")
     
-    spread = y - hedge_ratio * x
-    logging.debug(f"Spread stats for {asset1}-{asset2}: Mean={spread.mean():.4f}, Std={spread.std():.4f}")
+    # normalização para começar em 1
+    y_norm = y / y.iloc[0]
+    x_norm = x / x.iloc[0]
+    
+    # spread é a distância simples
+    spread = y_norm - x_norm
+    hedge_ratio = 1.0  # peso fixo
+    
+    logging.debug(
+        f"Spread stats for {asset1}-{asset2}: "
+        f"Mean={spread.mean():.4f}, Std={spread.std():.4f}"
+    )
     return spread, hedge_ratio
 
 def plot_sample_spread(pair, data, lookback):
@@ -471,7 +490,11 @@ def backtest_strategy(pairs: List[Tuple], data: pd.DataFrame, lookback: int,
     
     return sharpe, portfolio_returns.tolist(), total_trades, trade_log
 
-def calculate_metrics(returns, trade_log, rf_data):
+def calculate_metrics(
+    returns: pd.Series,
+    trade_log: List[dict],
+    rf_data: pd.DataFrame
+) -> Dict[str, float]:
     """
     Calcula métricas de desempenho a partir de retornos diários e log de trades fechados.
     Só considera trades fechados para as métricas de trade!
@@ -492,68 +515,88 @@ def calculate_metrics(returns, trade_log, rf_data):
         'win_rate': 0.0
     }
 
-    if isinstance(returns, pd.Series) and not returns.empty and isinstance(rf_data, pd.DataFrame) and not rf_data.empty:
-        # Calcula retornos em excesso
-        excess_ret = returns - rf_data['rf'].reindex(returns.index).ffill().fillna(0.0)
-        
-        # Retorno cumulativo
-        metrics['cumulative_return'] = (1 + excess_ret).cumprod().iloc[-1] - 1
-        
-        # Retorno anualizado
-        days = (returns.index[-1] - returns.index[0]).days if len(returns) > 1 else 1
-        metrics['annualized_return'] = (1 + metrics['cumulative_return']) ** (252 / max(days, 1)) - 1
-        
-        # Desvio padrão anualizado
-        std = excess_ret.std() * np.sqrt(252) if excess_ret.std() != 0 else 1e-9
-        
-        # Sharpe Ratio
-        metrics['sharpe_ratio'] = metrics['annualized_return'] / std if std != 0 else 0.0
-        
-        # Sortino Ratio
-        downside_std = excess_ret[excess_ret < 0].std() * np.sqrt(252) if excess_ret[excess_ret < 0].std() != 0 else 1e-9
-        metrics['sortino_ratio'] = metrics['annualized_return'] / downside_std if downside_std != 0 else 0.0
-        
-        # Omega Ratio
-        threshold = 0.0
-        gains = excess_ret[excess_ret > threshold].sum()
-        losses = -excess_ret[excess_ret < threshold].sum()
-        metrics['omega_ratio'] = gains / losses if losses != 0 else float('inf')
-        
-        # Kappa 3 Ratio
-        skewness = excess_ret.skew()
-        metrics['kappa_3_ratio'] = metrics['annualized_return'] / abs(skewness) if skewness != 0 else 0.0
-        
-        # Drawdowns
-        equity = (1 + excess_ret).cumprod()
-        drawdowns = equity / equity.cummax() - 1
-        metrics['max_drawdown'] = drawdowns.min()
-        metrics['avg_drawdown'] = drawdowns[drawdowns < 0].mean() if drawdowns[drawdowns < 0].size > 0 else 0.0
-        
-        # Calmar Ratio
-        metrics['calmar_ratio'] = metrics['annualized_return'] / abs(metrics['max_drawdown']) if metrics['max_drawdown'] != 0 else 0.0
-        
-        # Sterling Ratio
-        metrics['sterling_ratio'] = metrics['annualized_return'] / abs(metrics['avg_drawdown']) if metrics['avg_drawdown'] != 0 else 0.0
+    # --- Cálculo das métricas de retorno diário / risco ---
+    if isinstance(returns, pd.Series) and not returns.empty \
+       and isinstance(rf_data, pd.DataFrame) and 'rf' in rf_data.columns:
 
-    # ==== NOVO BLOCO PARA CONTABILIZAR APENAS TRADES FECHADOS ====
-    if trade_log:
-        # Considere apenas trades fechados
-        exit_types = [
-            "long_exit", "short_exit",
-            "stop_loss_long", "stop_loss_short",
-            "max_days_long", "max_days_short"
-        ]
-        trade_df = pd.DataFrame(trade_log)
-        if 'trade_type' in trade_df.columns and 'return' in trade_df.columns:
-            closed_trades = trade_df[trade_df['trade_type'].isin(exit_types)]
-            trade_returns = closed_trades['return'].dropna().tolist()
+        # Excess returns
+        rf_aligned = rf_data['rf'].reindex(returns.index).ffill().fillna(0.0)
+        excess_ret = returns - rf_aligned
+
+        # Cumulative & annualized return
+        cum_ret = (1 + excess_ret).cumprod().iloc[-1] - 1
+        metrics['cumulative_return'] = cum_ret
+
+        # Horizonte em anos pelo índice de datas
+        if isinstance(returns.index, pd.DatetimeIndex) and len(returns) > 1:
+            days = (returns.index[-1] - returns.index[0]).days
+            years = days / 365
         else:
-            # fallback (se nomes das colunas forem diferentes, adapte aqui)
-            trade_returns = []
-        
-        metrics['num_trades'] = len(trade_returns)
-        metrics['avg_trade_return'] = np.mean(trade_returns) if trade_returns else 0.0
-        metrics['win_rate'] = np.mean([r > 0 for r in trade_returns]) if trade_returns else 0.0
+            years = len(returns) / 365 if len(returns) > 0 else np.nan
+
+        if years > 0 and cum_ret > -1:
+            metrics['annualized_return'] = (1 + cum_ret) ** (1 / years) - 1
+
+        # Volatilidade anualizada
+        std_d = excess_ret.std(ddof=1)
+        std_a = std_d * np.sqrt(365) if std_d > 0 else np.nan
+
+        # Sharpe
+        if std_a > 0:
+            metrics['sharpe_ratio'] = metrics['annualized_return'] / std_a
+
+        # Sortino
+        downs = excess_ret[excess_ret < 0]
+        std_down = downs.std(ddof=1) * np.sqrt(365) if not downs.empty else np.nan
+        if std_down > 0:
+            metrics['sortino_ratio'] = metrics['annualized_return'] / std_down
+
+        # Omega
+        gains  = excess_ret[excess_ret > 0].sum()
+        losses = -excess_ret[excess_ret < 0].sum()
+        metrics['omega_ratio'] = gains / losses if losses > 0 else np.inf
+
+        # Kappa‑3 (downside third moment)
+        if not downs.empty and (downs**3).mean() > 0:
+            dd3 = ((downs**3).mean())**(1/3) * np.sqrt(365)
+            metrics['kappa_3_ratio'] = (metrics['annualized_return'] / dd3) if dd3 > 0 else np.nan
+
+        # Drawdowns
+        equity      = (1 + excess_ret).cumprod()
+        drawdowns   = equity / equity.cummax() - 1
+        max_dd      = drawdowns.min()
+        avg_dd      = drawdowns[drawdowns < 0].mean() if (drawdowns < 0).any() else 0.0
+        metrics['max_drawdown'] = max_dd
+        metrics['avg_drawdown'] = avg_dd
+
+        # Calmar & Sterling
+        if max_dd < 0:
+            metrics['calmar_ratio']   = metrics['annualized_return'] / abs(max_dd)
+        if avg_dd < 0:
+            metrics['sterling_ratio'] = metrics['annualized_return'] / abs(avg_dd)
+
+    # --- Métricas de trades fechados ---
+    if trade_log:
+        df = pd.DataFrame(trade_log)
+        if {'trade_type','return'}.issubset(df.columns):
+            exit_types = {
+                "long_exit", "short_exit",
+                "stop_loss_long", "stop_loss_short",
+                "max_days_long", "max_days_short"
+            }
+            closed = df[df['trade_type'].isin(exit_types)]
+            rets   = closed['return'].dropna().values.astype(float)
+        else:
+            rets = np.array([], dtype=float)
+
+        n = len(rets)
+        metrics['num_trades'] = n
+        metrics['win_rate']   = np.mean(rets > 0) if n > 0 else 0.0
+
+        if n > 0:
+            metrics['avg_trade_return'] = rets.mean()
+        else:
+            metrics['avg_trade_return'] = 0.0
 
     return metrics
 
@@ -1280,18 +1323,17 @@ def main(use_cache: bool = True, force_reprocess: Optional[List[int]] = None) ->
 
         # 10) Exibe métricas por período (formato único)
         logging.info("\nMétricas por Período:")
-        for period_idx, res in best_results.items():
-            msg = (
-                f"Período {period_idx}: Lookback={res['lookback']}, "
+        for res in best_results.values():
+            start = res['trading_start'].strftime('%Y-%m-%d')
+            end   = res['trading_end'].strftime('%Y-%m-%d')
+            logging.info(
+                f"Período {start} a {end}: "
+                f"Lookback={res['lookback']}, "
                 f"Sharpe={res['sharpe']:.4f}, "
                 f"Retorno={res['metrics']['cumulative_return']*100:.2f}%, "
                 f"Trades={res['metrics']['num_trades']}, "
                 f"Win Rate={res['metrics']['win_rate']:.4f}"
             )
-            logging.info(msg)
-
-        logging.info(f"\nResultados salvos em {RESULTS_DIR}")
-        logging.info(f"Tempo total de execução: {time.time()-start_time:.2f}s")
 
         # 11) Geração de gráficos e arquivos de saída
         try:
